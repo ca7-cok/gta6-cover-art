@@ -1,40 +1,194 @@
-// A working gta6-cover-art-01 entry (Node 22, standard library only): the app is this directory's app/ folder, plain
-// static files a desktop browser loads offline (app/index.html and its ES modules, no library and no network
-// request), and the program hands it in. It copies app/ and screenshots/ from beside this file to /output and writes
-// /output/dossier.json, the summary the judge reads, with the vendored make.fun library. Only the plumbing, not the
-// cover art the bounty asks for: Cover Snap, a plain one-photo square cover with a sunset tint and a bold caption,
-// exported as a 1080 x 1080 PNG. Its two sample photos (app/samples/) were made for make.fun with an image model and
-// are free to use. Build your own GTA-style cover maker in its place, put your 3 or 4 PNG or JPEG screenshots in
-// screenshots/ (the first by name is the cover) and run it.
+// Neon Coast Cover Studio — entrypoint.
 //
-// Serve it locally with `node serve.ts`, then open http://localhost:8080.
-// Outside the grader's container, MAKEFUN_OUTPUT_DIR stands in for /output:
-//   mkdir -p out && MAKEFUN_OUTPUT_DIR=out node main.ts
+// Hands the app in to the grader: copies app/ and screenshots/ from this
+// repository into the output directory and writes /output/dossier.json with
+// buildDossier from vendor/makefun-app.ts. Node 22, standard library only.
+//
+// Usage:
+//   MAKEFUN_OUTPUT_DIR=out node main.ts     # local run, writes ./out
+//   node main.ts                            # grader run, writes /output
+//
+// The output directory is emptied first, so two runs write the same bytes.
 
-import { cpSync, existsSync, mkdirSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { buildDossier, DossierError } from './vendor/makefun-app.ts';
+import {
+  copyFileSync,
+  lstatSync,
+  mkdirSync,
+  readdirSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from 'node:fs';
+import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { buildDossier } from './vendor/makefun-app.ts';
 
-const here = fileURLToPath(new URL('.', import.meta.url));
-const out = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
+/** The caps the bounty's gate hands buildDossier (gate.json's keys). */
+const DOSSIER_CAPS = {
+  text_max_bytes: 163840,
+  screenshots: { max: 4, max_bytes: 262144 },
+  app_max_files: 993,
+  app_max_bytes: 50331648,
+} as const;
 
-mkdirSync(out, { recursive: true });
-cpSync(join(here, 'app'), join(out, 'app'), { recursive: true });
-mkdirSync(join(out, 'screenshots'), { recursive: true });
-if (existsSync(join(here, 'screenshots'))) cpSync(join(here, 'screenshots'), join(out, 'screenshots'), { recursive: true });
+/** The most bytes one screenshot may be (the gate's screenshots.max_bytes). */
+const SHOT_MAX_BYTES = 262144;
+/** How many screenshots the entry hands in: at least 3, at most 4. */
+const SHOT_MIN_COUNT = 3;
+const SHOT_MAX_COUNT = 4;
+/** The image extensions screenshots/ may hold. */
+const SHOT_EXTENSIONS = new Set(['.png', '.jpg', '.jpeg']);
 
-// The scorer's own caps (reference/gate.json): only text_max_bytes shapes the bytes; the others refuse an entry the
-// scorer would refuse (more than 4 screenshots or one over 256 KiB; more than 993 files in app/ or 48 MiB of app
-// files, in all, or a path under app/ over 1000 bytes: app/ counts beside /output's own 1000-entry cap, its
-// screenshots/ and dossier.json).
-writeFileSync(
-  join(out, 'dossier.json'),
-  buildDossier(out, {
-    text_max_bytes: 163840,
-    screenshots: { max: 4, max_bytes: 262144 },
-    app_max_files: 993,
-    app_max_bytes: 50331648,
-    app_path_max_bytes: 1000,
-  }),
-);
+/** A fatal problem: printed as `main.ts: <message>` and the process exits 1. */
+class EntryError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'EntryError';
+  }
+}
+
+/** The repository root: the directory this file lives in. */
+function repoRoot(): string {
+  return dirname(fileURLToPath(import.meta.url));
+}
+
+/** The output directory: MAKEFUN_OUTPUT_DIR outside the grader, /output inside it. */
+function outputDir(): string {
+  const env = (process.env.MAKEFUN_OUTPUT_DIR ?? '').trim();
+  return resolve(env === '' ? '/output' : env);
+}
+
+/** Whether `path` is a directory. */
+function isDirectory(path: string): boolean {
+  try {
+    return lstatSync(path).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+/** Whether `path` is a plain file. */
+function isFile(path: string): boolean {
+  try {
+    return lstatSync(path).isFile();
+  } catch {
+    return false;
+  }
+}
+
+/** The entry's inputs, checked before anything is copied. */
+function checkInputs(root: string): { appDir: string; shotsDir: string; shots: string[] } {
+  const appDir = join(root, 'app');
+  const shotsDir = join(root, 'screenshots');
+  if (!isDirectory(appDir)) throw new EntryError(`app/: no such directory in ${root}`);
+  if (!isFile(join(appDir, 'index.html'))) {
+    throw new EntryError('app/index.html: no such file: the app needs its page');
+  }
+  if (!isDirectory(shotsDir)) throw new EntryError(`screenshots/: no such directory in ${root}`);
+  const shots = readdirSync(shotsDir)
+    .filter((name) => !name.startsWith('.'))
+    .sort();
+  if (shots.length < SHOT_MIN_COUNT || shots.length > SHOT_MAX_COUNT) {
+    throw new EntryError(
+      `screenshots/: holds ${shots.length} images, need ${SHOT_MIN_COUNT} to ${SHOT_MAX_COUNT}`,
+    );
+  }
+  for (const name of shots) {
+    const path = join(shotsDir, name);
+    if (!isFile(path)) throw new EntryError(`screenshots/${name}: not a plain file`);
+    const lower = name.toLowerCase();
+    const dot = lower.lastIndexOf('.');
+    if (dot < 0 || !SHOT_EXTENSIONS.has(lower.slice(dot))) {
+      throw new EntryError(`screenshots/${name}: not a PNG or JPEG image`);
+    }
+    const bytes = statSync(path).size;
+    if (bytes > SHOT_MAX_BYTES) {
+      throw new EntryError(`screenshots/${name}: ${bytes} bytes, over the ${SHOT_MAX_BYTES} allowed`);
+    }
+  }
+  return { appDir, shotsDir, shots };
+}
+
+/** Copies one tree into another, entries in sorted order so the copy is stable. */
+function copyTree(from: string, to: string): { files: number; bytes: number } {
+  let files = 0;
+  let bytes = 0;
+  mkdirSync(to, { recursive: true });
+  for (const name of readdirSync(from).sort()) {
+    const src = join(from, name);
+    const dst = join(to, name);
+    if (isDirectory(src)) {
+      const sub = copyTree(src, dst);
+      files += sub.files;
+      bytes += sub.bytes;
+    } else if (isFile(src)) {
+      copyFileSync(src, dst);
+      files++;
+      bytes += statSync(src).size;
+    } else {
+      throw new EntryError(`${src}: a symbolic link or special file, not copied`);
+    }
+  }
+  return { files, bytes };
+}
+
+/** Empties the output directory, refusing to touch the repository or the filesystem root. */
+function prepareOutput(out: string, root: string): void {
+  if (out === '/' || out === root || root.startsWith(`${out}/`)) {
+    throw new EntryError(`refusing to empty the output directory ${out}`);
+  }
+  rmSync(out, { recursive: true, force: true });
+  mkdirSync(out, { recursive: true });
+}
+
+function main(): void {
+  const root = repoRoot();
+  const out = outputDir();
+  const { appDir, shotsDir, shots } = checkInputs(root);
+  prepareOutput(out, root);
+
+  const appCopied = copyTree(appDir, join(out, 'app'));
+  const shotsCopied = copyTree(shotsDir, join(out, 'screenshots'));
+
+  let dossier: Uint8Array;
+  try {
+    dossier = buildDossier(out, DOSSIER_CAPS);
+  } catch (err) {
+    if (err instanceof DossierError) {
+      throw new EntryError(
+        `dossier: ${err.message}${err.limit === null ? '' : ` (limit: ${err.limit})`}`,
+      );
+    }
+    throw err;
+  }
+  writeFileSync(join(out, 'dossier.json'), dossier);
+
+  // The grader runs the entry twice and requires the same bytes both times:
+  // rebuild the dossier from what was just written and refuse to hand in a
+  // result that does not reproduce itself.
+  const rebuilt = buildDossier(out, DOSSIER_CAPS);
+  if (!Buffer.from(dossier).equals(Buffer.from(rebuilt))) {
+    throw new EntryError('dossier: a second build from /output differs, not deterministic');
+  }
+
+  console.log(`Neon Coast Cover Studio: wrote ${out}`);
+  console.log(
+    `  app/: ${appCopied.files} files (${appCopied.bytes} bytes), ` +
+      `screenshots/: ${shotsCopied.files} files (${shotsCopied.bytes} bytes)`,
+  );
+  console.log(
+    `  dossier.json: ${dossier.length} bytes, ` +
+      `cover ${shots[0] ?? '(none)'}, ${shots.length} screenshots`,
+  );
+}
+
+try {
+  main();
+} catch (err) {
+  if (err instanceof EntryError || err instanceof DossierError) {
+    console.error(`main.ts: ${err.message}`);
+  } else {
+    console.error(`main.ts: ${(err as Error).message}`);
+  }
+  process.exit(1);
+}
