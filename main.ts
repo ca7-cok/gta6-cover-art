@@ -137,8 +137,32 @@ function prepareOutput(out: string, root: string): void {
   if (out === '/' || out === root || root.startsWith(`${out}/`)) {
     throw new EntryError(`refusing to empty the output directory ${out}`);
   }
-  rmSync(out, { recursive: true, force: true });
-  mkdirSync(out, { recursive: true });
+  // The grader mounts /output as a writable directory on a read-only
+  // filesystem and runs the entry as user 65534: that user may write
+  // inside /output, but removing /output itself needs write permission on
+  // its parent, which the read-only filesystem does not grant — so the
+  // previous rmSync(out, { recursive: true }) died with EACCES there.
+  // Empty the directory's contents and leave the directory standing.
+  let exists = false;
+  try {
+    lstatSync(out);
+    exists = true;
+  } catch {
+    exists = false;
+  }
+  if (!exists) {
+    mkdirSync(out, { recursive: true });
+    return;
+  }
+  if (!isDirectory(out)) {
+    // A stray file where the directory should be: remove it, then make the directory.
+    rmSync(out, { force: true });
+    mkdirSync(out, { recursive: true });
+    return;
+  }
+  for (const name of readdirSync(out).sort()) {
+    rmSync(join(out, name), { recursive: true, force: true });
+  }
 }
 
 function main(): void {
